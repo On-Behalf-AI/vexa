@@ -3,8 +3,15 @@
 # --- Paths ---
 ROOT := $(shell git rev-parse --show-toplevel)
 COMPOSE_FILE := $(ROOT)/deploy/compose/docker-compose.yml
+COMPOSE_OVERRIDE := $(ROOT)/deploy/compose/docker-compose.override.yml
 ENV_FILE := $(ROOT)/.env
 ENV_EXAMPLE := $(ROOT)/deploy/env-example
+
+# Conditionally include override file if present (gitignored, for local customizations)
+COMPOSE_FILES := -f $(COMPOSE_FILE)
+ifneq ($(wildcard $(COMPOSE_OVERRIDE)),)
+COMPOSE_FILES += -f $(COMPOSE_OVERRIDE)
+endif
 
 LAST_TAG_FILE := $(ROOT)/deploy/compose/.last-tag
 
@@ -23,7 +30,7 @@ BOT_IMAGE := vexa-bot
 
 -include $(ENV_FILE)
 
-COMPOSE_CMD = docker compose --env-file $(ENV_FILE) -f $(COMPOSE_FILE)
+COMPOSE_CMD = docker compose --env-file $(ENV_FILE) $(COMPOSE_FILES)
 
 # ============================================================================
 # Main targets
