@@ -1,11 +1,12 @@
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { log } from "./utils";
+import { logJSON, setLogContext } from "./utils/log";
 import { callStatusChangeCallback, mapExitReasonToStatus } from "./services/unified-callback";
 import { chromium } from "playwright-extra";
 import { handleGoogleMeet, leaveGoogleMeet } from "./platforms/googlemeet";
 import { handleMicrosoftTeams, leaveMicrosoftTeams } from "./platforms/msteams";
 import { handleZoom, leaveZoom, leaveZoomWeb } from "./platforms/zoom";
-import { reconfigureZoomWebRecording, getLastActiveSpeaker } from "./platforms/zoom/web/recording";
+import { reconfigureZoomWebRecording } from "./platforms/zoom/web/recording";
 import { getZoomSpeakerEvents } from "./platforms/zoom/strategies/recording";
 import { browserArgs, getBrowserArgs, getAuthenticatedBrowserArgs, userAgent } from "./constans";
 import { BotConfig } from "./types";
@@ -56,6 +57,9 @@ let browserInstance: Browser | null = null;
 // --- Recording service reference (set by platform handlers) ---
 let activeRecordingService: RecordingService | null = null;
 let activeVideoRecordingService: VideoRecordingService | null = null;
+// v0.10.5.3 Pack T — module-level holder so performGracefulLeave can read
+// the resource summary at exit time and stop the sampler.
+let currentBotResourceSampler: ReturnType<typeof startBotResourceSampler> | null = null;
 let botPaSinkModuleId: string | null = null; // PulseAudio module ID for per-bot sink cleanup
 let currentBotConfig: BotConfig | null = null;
 export function setActiveRecordingService(svc: RecordingService | null): void {
@@ -93,7 +97,11 @@ export function startVideoRecordingIfNeeded(): void {
   if (!currentBotConfig) return;
   const wantsVideoCapture = !!currentBotConfig.recordingEnabled &&
     Array.isArray(currentBotConfig.captureModes) && currentBotConfig.captureModes.includes('video');
-  const isZoomNative = currentBotConfig.platform === 'zoom' && process.env.ZOOM_WEB !== 'true';
+  // Zoom Web is the default; opt into Native SDK with ZOOM_SDK=true (and
+  // valid ZOOM_CLIENT_ID/SECRET). Legacy ZOOM_WEB=true still forces Web.
+  const isZoomNative = currentBotConfig.platform === 'zoom'
+    && process.env.ZOOM_SDK === 'true'
+    && process.env.ZOOM_WEB !== 'true';
 
   if (wantsVideoCapture && !isZoomNative) {
     try {
@@ -106,7 +114,7 @@ export function startVideoRecordingIfNeeded(): void {
       activeVideoRecordingService = null;
     }
   } else if (wantsVideoCapture && isZoomNative) {
-    log('[VideoRecording] Video recording not supported for Zoom Native SDK — use ZOOM_WEB=true for screen capture');
+    log('[VideoRecording] Video recording not supported for Zoom Native SDK — unset ZOOM_SDK to use the default Web client (screen capture works there)');
   }
 }
 
@@ -487,11 +495,12 @@ const handleRedisMessage = async (message: string, channel: string, page: Page |
           allowedLanguages = command.allowed_languages?.length ? command.allowed_languages : null;
           currentTask = command.task;
 
-          // Zoom Web uses a Node.js-side WhisperLive (not browser-based) — reconfigure directly
-          const isZoomWeb = process.env.ZOOM_WEB === 'true' && (globalThis as any).botConfig?.platform === 'zoom';
+          // Zoom Web is the default; isZoomWeb is true unless ZOOM_SDK=true
+          // explicitly opts into the native SDK path.
+          const isZoomWeb = (globalThis as any).botConfig?.platform === 'zoom'
+            && (process.env.ZOOM_WEB === 'true' || process.env.ZOOM_SDK !== 'true');
           if (isZoomWeb) {
             await reconfigureZoomWebRecording(currentLanguage ?? null, currentTask ?? null);
-            log('[Zoom Web] Reconfigure handled via Node.js WhisperLive reconnect');
           }
 
           // Trigger browser-side reconfiguration via the exposed function (for Google Meet / Teams)
@@ -629,18 +638,35 @@ async function performGracefulLeave(
   errorDetails?: any // Optional detailed error information
 ): Promise<void> {
   if (isShuttingDown) {
-    log("[Graceful Leave] Already in progress, ignoring duplicate call.");
+    logJSON({
+      level: "warn",
+      msg: "[Graceful Leave] Already in progress, ignoring duplicate call",
+      reason,
+      exit_code: exitCode,
+    });
     return;
   }
   isShuttingDown = true;
-  log(`[Graceful Leave] Initiating graceful shutdown sequence... Reason: ${reason}, Exit Code: ${exitCode}`);
+  // v0.10.5 Pack G.1 (#272 issue 6) — emit the graceful-leave start
+  // event with structured fields. This is the diagnostic-critical
+  // window: Pack G.2's kubectl-logs capture reads stdout right up to
+  // pod termination, so every record in this function MUST be
+  // parseable by the operator's grep+jq tooling.
+  logJSON({
+    level: "info",
+    msg: "[Graceful Leave] Initiating graceful shutdown sequence",
+    reason,
+    exit_code: exitCode,
+    error_details: errorDetails ?? null,
+  });
 
   let platformLeaveSuccess = false;
 
   // Handle Zoom separately — SDK mode uses null page, web mode uses browser page
   if (currentPlatform === "zoom") {
     try {
-      const zoomWebMode = process.env.ZOOM_WEB === 'true';
+      // Zoom Web is the default; SDK is opt-in via ZOOM_SDK=true.
+      const zoomWebMode = process.env.ZOOM_WEB === 'true' || process.env.ZOOM_SDK !== 'true';
       if (zoomWebMode) {
         log("[Graceful Leave] Attempting Zoom Web cleanup...");
         platformLeaveSuccess = await leaveZoomWeb(page);
@@ -717,7 +743,7 @@ async function performGracefulLeave(
   // Stop video recording, mux audio in, and upload the combined file
   if (activeVideoRecordingService && currentBotConfig?.recordingUploadUrl && currentBotConfig?.token) {
     try {
-      log("[Graceful Leave] Stopping video recording...");
+      logJSON({ level: "info", msg: "[Graceful Leave] Stopping video recording" });
       await activeVideoRecordingService.stop();
 
       // Finalize audio and mux into the video so the upload is a single self-contained file
@@ -726,18 +752,33 @@ async function performGracefulLeave(
           const audioPath = await activeRecordingService.finalize();
           // Compute how much later audio started compared to video
           const audioDelayMs = activeRecordingService.getStartTime() - activeVideoRecordingService.getStartTime();
-          log(`[Graceful Leave] Muxing audio into video (audio delay: ${audioDelayMs}ms)...`);
+          logJSON({
+            level: "info",
+            msg: "[Graceful Leave] Muxing audio into video",
+            audio_delay_ms: audioDelayMs,
+          });
           await activeVideoRecordingService.muxAudio(audioPath, audioDelayMs);
         } catch (muxErr: any) {
-          log(`[Graceful Leave] Audio mux failed (will upload video-only): ${muxErr.message}`);
+          logJSON({
+            level: "warn",
+            msg: "[Graceful Leave] Audio mux failed (will upload video-only)",
+            error_message: muxErr?.message,
+            error_name: muxErr?.name,
+          });
         }
       }
 
-      log("[Graceful Leave] Uploading video to meeting-api...");
+      logJSON({ level: "info", msg: "[Graceful Leave] Uploading video to meeting-api" });
       await activeVideoRecordingService.upload(currentBotConfig.recordingUploadUrl, currentBotConfig.token);
-      log("[Graceful Leave] Video uploaded successfully.");
+      logJSON({ level: "info", msg: "[Graceful Leave] Video uploaded successfully" });
     } catch (uploadError: any) {
-      log(`[Graceful Leave] Video upload failed: ${uploadError.message}`);
+      logJSON({
+        level: "error",
+        msg: "[Graceful Leave] Video upload failed",
+        error_message: uploadError?.message,
+        error_name: uploadError?.name,
+        error_stack: uploadError?.stack,
+      });
     } finally {
       await activeVideoRecordingService.cleanup();
       activeVideoRecordingService = null;
@@ -747,11 +788,20 @@ async function performGracefulLeave(
   // Upload audio recording separately (used for audio-only playback / transcription alignment)
   if (activeRecordingService && currentBotConfig?.recordingUploadUrl && currentBotConfig?.token) {
     try {
-      log("[Graceful Leave] Uploading audio recording to meeting-api...");
+      logJSON({ level: "info", msg: "[Graceful Leave] Uploading audio recording to meeting-api" });
       await activeRecordingService.upload(currentBotConfig.recordingUploadUrl, currentBotConfig.token);
-      log("[Graceful Leave] Audio recording uploaded successfully.");
+      logJSON({ level: "info", msg: "[Graceful Leave] Audio recording uploaded successfully" });
     } catch (uploadError: any) {
-      log(`[Graceful Leave] Audio recording upload failed: ${uploadError.message}`);
+      // Recording-loss diagnostic: this is the line operators grep for in
+      // post-mortems. Emit every field that lets them recover from S3 +
+      // determine whether to retry (4xx) or escalate to platform (5xx).
+      logJSON({
+        level: "error",
+        msg: "[Graceful Leave] Audio recording upload failed",
+        error_message: uploadError?.message,
+        error_name: uploadError?.name,
+        error_stack: uploadError?.stack,
+      });
     } finally {
       await activeRecordingService.cleanup();
       activeRecordingService = null;
@@ -788,6 +838,30 @@ async function performGracefulLeave(
     log(`[Speaker Events] Failed to read: ${e?.message}`);
   }
 
+  // v0.10.5.3 Pack T — fetch the final resource summary BEFORE we stop
+  // the sampler. Pack O's ring buffer flush happens after — last log line
+  // emitted is the cgroup summary, so it's included in bot_logs too.
+  let finalBotResources: any = undefined;
+  if (currentBotResourceSampler) {
+    finalBotResources = currentBotResourceSampler.summary();
+    logJSON({
+      level: "info",
+      msg: "[BotResource] final summary",
+      bot_resources: finalBotResources,
+    });
+    currentBotResourceSampler.stop();
+    currentBotResourceSampler = null;
+  }
+
+  // v0.10.5.3 Pack O — snapshot the structured-log ring buffer for the
+  // exit callback. This is the in-process forensic capture: last ~200
+  // structured JSON lines from bot stdout, sent through the callback so
+  // meeting-api can persist into meetings.data.bot_logs.
+  // (Pack G.2 — k8s-side stdout aggregation — remains a follow-up; this
+  // gives us 80% of the forensic value with one ring buffer.)
+  const { getLogBuffer } = await import("./utils/log");
+  const finalBotLogs = [...getLogBuffer()];
+
   if (meetingApiCallbackUrl && currentConnectionId) {
     // Use unified callback for exit status
     const statusMapping = mapExitReasonToStatus(finalCallbackReason, finalCallbackExitCode);
@@ -807,14 +881,37 @@ async function performGracefulLeave(
         errorDetails,
         statusMapping.completionReason,
         statusMapping.failureStage,
-        speakerEvents.length > 0 ? speakerEvents : undefined
+        speakerEvents.length > 0 ? speakerEvents : undefined,
+        finalBotLogs.length > 0 ? finalBotLogs : undefined,
+        finalBotResources
       );
-      log(`[Graceful Leave] Unified exit callback sent successfully`);
+      logJSON({
+        level: "info",
+        msg: "[Graceful Leave] Unified exit callback sent successfully",
+        status: statusMapping.status,
+        completion_reason: statusMapping.completionReason,
+        failure_stage: statusMapping.failureStage,
+        final_callback_reason: finalCallbackReason,
+        final_callback_exit_code: finalCallbackExitCode,
+        speaker_event_count: speakerEvents.length,
+      });
     } catch (callbackError: any) {
-      log(`[Graceful Leave] Error sending unified exit callback: ${callbackError.message}`);
+      logJSON({
+        level: "error",
+        msg: "[Graceful Leave] Error sending unified exit callback",
+        error_message: callbackError?.message,
+        error_name: callbackError?.name,
+        final_callback_reason: finalCallbackReason,
+        final_callback_exit_code: finalCallbackExitCode,
+      });
     }
   } else {
-    log("[Graceful Leave] Bot manager callback URL or Connection ID not configured. Cannot send exit status.");
+    logJSON({
+      level: "error",
+      msg: "[Graceful Leave] Bot manager callback URL or Connection ID not configured — cannot send exit status",
+      has_callback_url: Boolean(meetingApiCallbackUrl),
+      has_connection_id: Boolean(currentConnectionId),
+    });
   }
 
   if (redisSubscriber && redisSubscriber.isOpen) {
@@ -855,7 +952,15 @@ async function performGracefulLeave(
   // Exit the process
   // The process exit code should reflect the overall success/failure.
   // If callback used finalCallbackExitCode, process.exit could use the same.
-  log(`[Graceful Leave] Exiting process with code ${finalCallbackExitCode} (Reason: ${finalCallbackReason}).`);
+  // v0.10.5 Pack G.1: emit the final exit record as structured JSON —
+  // this is the LAST line in the kubectl-logs capture for a clean pod
+  // exit, so it carries the diagnostic burden of "what happened?"
+  logJSON({
+    level: "info",
+    msg: "[Graceful Leave] Exiting process",
+    exit_code: finalCallbackExitCode,
+    reason: finalCallbackReason,
+  });
   process.exit(finalCallbackExitCode);
 }
 // --- ----------------------------- ---
@@ -1452,45 +1557,18 @@ async function handlePerSpeakerAudioData(speakerIndex: number, audioDataArray: n
     : currentPlatform === 'teams' ? 'msteams'
     : currentPlatform || 'unknown';
 
-  // ─── Zoom: DOM active speaker is the source of truth ───────────────────────
-  // Zoom SFU reuses ~3 audio tracks. Track ownership does NOT map to speakers —
-  // when Alice speaks, her audio may arrive on a track previously used by Bob.
-  // The DOM polling (getLastActiveSpeaker) correctly identifies who is speaking.
-  // We skip voting/locking entirely and always use the DOM-polled name.
-  if (platformKey === 'zoom') {
-    const domSpeaker = getLastActiveSpeaker() || '';
-
-    if (!speakerManager.hasSpeaker(speakerId)) {
-      log(`[🔊 NEW SPEAKER] Track ${speakerIndex} — first audio, DOM speaker: "${domSpeaker || '(none)'}"`);
-      speakerManager.addSpeaker(speakerId, domSpeaker);
-      lastReResolveTime.set(speakerId, Date.now());
-      if (domSpeaker) {
-        await segmentPublisher.publishSpeakerEvent({
-          speaker: domSpeaker,
-          type: 'joined',
-          timestamp: Date.now(),
-        });
-        log(`[📡 SPEAKER EVENT] "${domSpeaker}" joined → Redis`);
-      }
-    } else {
-      const currentName = speakerManager.getSpeakerName(speakerId) || '';
-      // Always update to current DOM speaker — tracks are NOT stable on Zoom
-      if (domSpeaker && domSpeaker !== currentName) {
-        log(`[🔄 ZOOM SPEAKER] Track ${speakerIndex}: "${currentName}" → "${domSpeaker}" (DOM active speaker)`);
-        speakerManager.updateSpeakerName(speakerId, domSpeaker);
-        if (!currentName) {
-          await segmentPublisher.publishSpeakerEvent({
-            speaker: domSpeaker,
-            type: 'joined',
-            timestamp: Date.now(),
-          });
-          log(`[📡 SPEAKER EVENT] "${domSpeaker}" joined → Redis`);
-        }
-      }
-    }
-  }
-  // ─── GMeet / Teams: voting + locking (tracks ARE stable) ───────────────────
-  else if (!speakerManager.hasSpeaker(speakerId)) {
+  // ─── GMeet / Teams / Zoom: voting + locking ────────────────────────────────
+  // All three platforms use the shared resolveSpeakerName() pipeline with
+  // per-platform DOM resolvers (resolveGoogleMeetSpeakerName,
+  // resolveTeamsSpeakerName, resolveZoomSpeakerName).
+  //
+  // Live observation 2026-04-26 confirmed Zoom Web's MediaStream pool is
+  // small (~6 streams) and stream_id is stable per speaker (88%+ of audible
+  // ticks per stream attribute to one dominant speaker). speakerIndex is
+  // captured at first connectElement() per stream_id and never changes for
+  // that stream — equivalent to gmeet's stable per-tile track. Vote-and-lock
+  // works correctly here; PR #181's per-chunk DOM-poll override was the bug.
+  if (!speakerManager.hasSpeaker(speakerId)) {
     log(`[🔊 NEW SPEAKER] Track ${speakerIndex} — first audio received, resolving name...`);
     const name = await resolveSpeakerName(page, speakerIndex, platformKey, currentBotConfig?.botName);
     // Start unmapped — only assign if name is genuinely unique
@@ -1966,10 +2044,113 @@ export async function startPerSpeakerAudioCapture(pageToCaptureFrom: Page): Prom
 }
 
 // ==================================================================
+// v0.10.5.3 Pack T — bot resource telemetry (cgroup mem + CPU sampler)
+// ==================================================================
+
+interface BotResourceSampler {
+  stop: () => void;
+  summary: () => {
+    samples: number;
+    peak_memory_bytes: number | null;
+    last_memory_bytes: number | null;
+    cpu_usage_usec_total: number | null;
+    sampler_started_at: string;
+    cgroup_available: boolean;
+  };
+}
+
+/**
+ * Periodically polls /sys/fs/cgroup/memory.current and /sys/fs/cgroup/cpu.stat
+ * (cgroup v2). Emits a structured log line per sample. Tracks peak memory
+ * + last sample for the exit-callback to attach to bot_resources field.
+ *
+ * Designed to be safe on hosts where cgroup paths don't exist (dev macOS
+ * runs, non-cgroup-v2 systems): all file reads are wrapped in try/catch
+ * and the sampler emits a single "cgroup_unavailable" log line then
+ * stops sampling. Per Pack P (no fallbacks unless explicitly decided),
+ * we do NOT silently swap to a per-process /proc/self/status reader —
+ * if cgroup is unavailable the telemetry is unavailable, full stop.
+ */
+function startBotResourceSampler(): BotResourceSampler {
+  const fs = require("fs") as typeof import("fs");
+  const sampleIntervalMs = 30_000;
+  const startedAt = new Date().toISOString();
+  const memoryPath = "/sys/fs/cgroup/memory.current";
+  const cpuStatPath = "/sys/fs/cgroup/cpu.stat";
+  let samples = 0;
+  let peakMemory: number | null = null;
+  let lastMemory: number | null = null;
+  let cumulativeCpuUsec: number | null = null;
+  let cgroupAvailable = false;
+
+  // Probe cgroup availability once at start.
+  try {
+    fs.statSync(memoryPath);
+    fs.statSync(cpuStatPath);
+    cgroupAvailable = true;
+  } catch {
+    logJSON({
+      level: "info",
+      msg: "[BotResource] cgroup_unavailable — sampler disabled (expected on dev macOS / non-cgroup-v2 hosts)",
+      memory_path: memoryPath,
+      cpu_stat_path: cpuStatPath,
+    });
+  }
+
+  const tick = () => {
+    if (!cgroupAvailable) return;
+    try {
+      const memRaw = fs.readFileSync(memoryPath, "utf-8").trim();
+      const memBytes = parseInt(memRaw, 10);
+      if (!Number.isNaN(memBytes)) {
+        lastMemory = memBytes;
+        if (peakMemory === null || memBytes > peakMemory) peakMemory = memBytes;
+      }
+      const cpuStat = fs.readFileSync(cpuStatPath, "utf-8");
+      const cpuUsageMatch = cpuStat.match(/usage_usec\s+(\d+)/);
+      if (cpuUsageMatch) cumulativeCpuUsec = parseInt(cpuUsageMatch[1], 10);
+      samples += 1;
+      logJSON({
+        level: "debug",
+        msg: "[BotResource] sample",
+        sample_index: samples,
+        memory_bytes: memBytes,
+        cpu_usage_usec: cumulativeCpuUsec,
+        peak_memory_bytes: peakMemory,
+      });
+    } catch (err: any) {
+      // Per Pack P: no silent fallback. Log and stop sampling on error.
+      logJSON({
+        level: "warn",
+        msg: "[BotResource] sample failed — disabling sampler",
+        error_message: err?.message || String(err),
+      });
+      cgroupAvailable = false;
+    }
+  };
+
+  // Sample once immediately for a baseline, then on interval.
+  tick();
+  const handle = setInterval(tick, sampleIntervalMs);
+
+  return {
+    stop: () => clearInterval(handle),
+    summary: () => ({
+      samples,
+      peak_memory_bytes: peakMemory,
+      last_memory_bytes: lastMemory,
+      cpu_usage_usec_total: cumulativeCpuUsec,
+      sampler_started_at: startedAt,
+      cgroup_available: cgroupAvailable,
+    }),
+  };
+}
+
+// ==================================================================
 
 export async function runBot(botConfig: BotConfig): Promise<void> {// Store botConfig globally for command validation
   (globalThis as any).botConfig = botConfig;
-  
+
   // --- UPDATED: Parse and store config values ---
   currentLanguage = botConfig.language;
   allowedLanguages = botConfig.allowedLanguages?.length ? botConfig.allowedLanguages : null;
@@ -1980,14 +2161,49 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
   currentPlatform = botConfig.platform; // Set currentPlatform here
   currentBotConfig = botConfig; // Store full config for recording upload
 
+  // v0.10.5 Pack G.1 (#272 issue 6) — populate the structured-logger
+  // context once per-bot from BotConfig. Every subsequent log line
+  // (whether emitted via the legacy `log(message)` shim or directly
+  // via `logJSON({...})`) automatically carries meeting_id, session_uid,
+  // platform, container_name, connection_id. K8s `kubectl logs` capture
+  // (Pack G.2) becomes deterministically grep+jq-able from this point.
+  setLogContext({
+    meeting_id: botConfig.meeting_id,
+    session_uid: botConfig.connectionId,
+    platform: botConfig.platform,
+    container_name: process.env.HOSTNAME || undefined,
+    connection_id: botConfig.connectionId,
+    bot_name: botConfig.botName,
+  });
+
+  // v0.10.5.3 Pack T — bot resource telemetry (cgroup-based mem + CPU sampler).
+  // Reads /sys/fs/cgroup/memory.current + /sys/fs/cgroup/cpu.stat every 30s
+  // and emits a structured-log line per sample. Pack O ingests these into
+  // the per-meeting JSONB so operators can answer "did the bot run out of
+  // memory?" without guesswork. Cost: 2 file reads × every 30s ~= 0; the
+  // sampler is non-blocking and skips sampling on hosts where cgroup paths
+  // don't exist (dev macOS / non-cgroupv2 hosts). Sampler is stored at
+  // module scope so performGracefulLeave can fetch the summary at exit.
+  currentBotResourceSampler = startBotResourceSampler();
+
   // Destructure other needed config values
   const { meetingUrl, platform, botName } = botConfig;
 
-  log(
-    `Starting bot for ${platform} with URL: ${meetingUrl}, name: ${botName}, language: ${currentLanguage}, ` +
-    `allowedLanguages: ${allowedLanguages ? JSON.stringify(allowedLanguages) : 'none'}, ` +
-    `task: ${currentTask}, transcribeEnabled: ${botConfig.transcribeEnabled !== false}, connectionId: ${currentConnectionId}`
-  );
+  // Initial bot-startup record uses logJSON directly so the operator
+  // sees the structured fields (rather than the prefix-parser making
+  // its best guess on an unprefixed message).
+  logJSON({
+    level: "info",
+    msg: "Bot startup",
+    meeting_url: meetingUrl,
+    platform,
+    bot_name: botName,
+    language: currentLanguage,
+    allowed_languages: allowedLanguages ?? null,
+    task: currentTask,
+    transcribe_enabled: botConfig.transcribeEnabled !== false,
+    connection_id: currentConnectionId,
+  });
 
   // Fail fast: meeting_id must be present for control-plane commands
   const meetingId = botConfig.meeting_id;
@@ -2035,9 +2251,11 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
   }
   // -------------------------------------------------
 
-  // For Zoom Web: create a per-bot PulseAudio null sink so concurrent bots don't
-  // cross-contaminate each other's audio via the shared zoom_sink.monitor.
-  if (botConfig.platform === 'zoom' && process.env.ZOOM_WEB === 'true') {
+  // For Zoom Web (default): create a per-bot PulseAudio null sink so
+  // concurrent bots don't cross-contaminate each other's audio via the
+  // shared zoom_sink.monitor. Skip for the native-SDK path.
+  if (botConfig.platform === 'zoom'
+      && (process.env.ZOOM_WEB === 'true' || process.env.ZOOM_SDK !== 'true')) {
     const sinkName = `bot_sink_${botConfig.meeting_id}`;
     try {
       const moduleId = execSync(
@@ -2228,13 +2446,40 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
     }
   });
 
-  // Monitor frames for WebRTC usage (Teams may use iframes)
+  // v0.10.5 #284 diagnostic — capture page navigation/crash events that destroy
+  // the page.evaluate execution context. Pre-fix the framenavigated handler
+  // explicitly EXCLUDED main-frame navigations, hiding the root cause of #284
+  // ("page.evaluate: Execution context was destroyed, most likely because of a
+  // navigation"). Now we log every navigation, dialog, popup, and crash so the
+  // post-incident audit shows EXACTLY what URL/event killed the context.
   page.on('frameattached', (frame) => {
     log(`[Frame] New frame attached: ${frame.url() || '(empty)'}`);
   });
   page.on('framenavigated', (frame) => {
-    if (frame !== page!.mainFrame()) {
-      log(`[Frame] Sub-frame navigated: ${frame.url()}`);
+    const isMain = frame === page!.mainFrame();
+    log(`[Frame] ${isMain ? 'MAIN-FRAME' : 'sub-frame'} navigated: ${frame.url()}`);
+  });
+  page.on('crash', () => {
+    log(`[Page] !!! TAB CRASHED — Chromium tab process died. Likely OOM or sandbox kill. Last URL: ${page?.url() || '(unknown)'}`);
+  });
+  page.on('close', () => {
+    log(`[Page] PAGE CLOSED — last URL: ${page?.url() || '(unknown)'}`);
+  });
+  page.on('dialog', async (dialog) => {
+    log(`[Page] DIALOG fired (type=${dialog.type()}, msg=${dialog.message()}) — accepting to prevent block`);
+    try { await dialog.accept(); } catch { /* dialog already dismissed */ }
+  });
+  page.on('popup', (popup) => {
+    log(`[Page] POPUP opened: ${popup.url()}`);
+  });
+  page.on('pageerror', (err: Error) => {
+    log(`[Page] PAGE-ERROR: ${err.name}: ${err.message}${err.stack ? '\n' + err.stack.split('\n').slice(0, 3).join('\n') : ''}`);
+  });
+  page.on('requestfailed', (request) => {
+    // Only log failed requests on the main GMeet domain — too noisy otherwise
+    const url = request.url();
+    if (url.includes('meet.google.com') || url.includes('googleusercontent') || url.includes('googleapis')) {
+      log(`[Page] REQUEST-FAILED: ${request.method()} ${url} — ${request.failure()?.errorText || 'unknown'}`);
     }
   });
 

@@ -115,20 +115,35 @@ spec:
             {{- end }}
             - name: MINIO_SECURE
               value: {{ .Values.meetingApi.minioSecure | default "false" | quote }}
+            # v0.10.5.3 Pack D-3 follow-up (Option B): MINIO_PUBLIC_ENDPOINT
+            # is the browser-reachable hostname used to sign download URLs.
+            # MINIO_ENDPOINT (above) stays in-cluster for fast server-side I/O.
+            # When unset/empty, storage.py falls back to MINIO_ENDPOINT.
+            # Set this when MinIO Service.type=NodePort and you have an
+            # external IP, OR when an ingress fronts MinIO under an FQDN.
+            - name: MINIO_PUBLIC_ENDPOINT
+              value: {{ .Values.meetingApi.minioPublicEndpoint | default "" | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.meetingApi.logLevel | default "INFO" | quote }}
             {{- with .Values.meetingApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          # v0.10.5 Pack C.4 — readinessProbe gated on consumer-up.
+          # /readyz returns 503 until startup_complete (Redis ping
+          # succeeded AND xgroup_create succeeded AND consumer tasks
+          # alive). K8s Service routes traffic only to Ready pods, so
+          # a pod with no working consumer never receives traffic.
           readinessProbe:
             httpGet:
-              path: /docs
+              path: /readyz
               port: http
             initialDelaySeconds: 15
             periodSeconds: 10
+            failureThreshold: 3
+          # /health = HTTP-loop liveness (always 200 unless event loop wedges)
           livenessProbe:
             httpGet:
-              path: /docs
+              path: /health
               port: http
             initialDelaySeconds: 45
             periodSeconds: 20

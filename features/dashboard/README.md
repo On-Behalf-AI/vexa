@@ -24,9 +24,9 @@ Login (magic link or direct) → meetings list → click meeting → meeting det
 
 
 <!-- BEGIN AUTO-DOD -->
-<!-- Auto-written by tests3/lib/aggregate.py from release tag `0.10.0-260421-2123`. Do not edit by hand — edit the sidecar `dods.yaml` + re-run `make -C tests3 report --write-features`. -->
+<!-- Auto-written by tests3/lib/aggregate.py from release tag `0.10.5.3-260503-0119`. Do not edit by hand — edit the sidecar `dods.yaml` + re-run `make -C tests3 report --write-features`. -->
 
-**Confidence: 95%** (gate: 90%, status: ✅ pass)
+**Confidence: 94%** (gate: 90%, status: ✅ pass)
 
 | # | Behavior | Weight | Status | Evidence (modes) |
 |---|----------|-------:|:------:|------------------|
@@ -43,10 +43,13 @@ Login (magic link or direct) → meetings list → click meeting → meeting det
 | transcript-proxy | Transcript reachable through dashboard proxy | 5 | ⚠️ skip | `compose`: dashboard-proxy/transcript_proxy: no meetings with transcripts; `helm`: dashboard-proxy/transcript_proxy: no meetings with transcripts |
 | bot-create-proxy | POST /api/vexa/bots reaches the gateway and creates a bot (or returns 403/409) | 5 | ✅ pass | `compose`: dashboard-proxy/bot_create_proxy: HTTP 201; `helm`: dashboard-proxy/bot_create_proxy: HTTP 201 |
 | dashboard-up | Dashboard root page responds | 5 | ✅ pass | `lite`: smoke-health/DASHBOARD_UP: dashboard serves pages — user can access the UI; `compose`: smoke-health/DASHBOARD_UP: dashboard serves pages — user can access the UI; `helm`: smoke-health/DASHBOARD_UP: dashboard serves pages — user can access the UI |
-| dashboard-ws-url | NEXT_PUBLIC_WS_URL is set — live updates can connect | 5 | ✅ pass | `lite`: smoke-health/DASHBOARD_WS_URL: ws://localhost:3000/ws; `compose`: smoke-health/DASHBOARD_WS_URL: ws://localhost:3001/ws; `helm`: smoke-health/DASHBOARD_WS_URL: ws://172.236.111.198:30001/ws |
+| dashboard-ws-url | NEXT_PUBLIC_WS_URL is set — live updates can connect | 5 | ✅ pass | `lite`: smoke-health/DASHBOARD_WS_URL: ws://localhost:3000/ws; `compose`: smoke-health/DASHBOARD_WS_URL: ws://localhost:3001/ws; `helm`: smoke-health/DASHBOARD_WS_URL: ws://172.232.25.127:30001/ws |
 | dashboard-admin-key-valid | Dashboard's VEXA_ADMIN_API_KEY is accepted by admin-api (login path works) | 5 | ✅ pass | `lite`: smoke-env/DASHBOARD_ADMIN_KEY_VALID: dashboard can authenticate to admin-api — user lookup and login will work; `compose`: smoke-env/DASHBOARD_ADMIN_KEY_VALID: dashboard can authenticate to admin-api — user lookup and login will work; `helm`: smoke-env/DASHBOARD_ADMIN_KEY_VALID: dashboard… |
 | packages-transcript-rendering-tests-pass | packages/transcript-rendering npm test passes — guards the dedup-prefers-confirmed fix + existing 76 tests | 5 | ✅ pass | `lite`: package-tests/TRANSCRIPT_RENDERING_DEDUP_TESTS_PASS: npm unavailable on this harness; source-level dedup-prefers-confirmed pattern present (PR-time CI is authoritative) |
 | packages-ci-workflow-exists | .github/workflows/test-packages.yml exists and runs npm test per package in matrix | 5 | ✅ pass | `lite`: smoke-static/PACKAGES_CI_WORKFLOW_EXISTS: .github/workflows/test-packages.yml exists and runs npm test on packages/* |
+| download-returns-presigned-url-to-master | GET /recordings/{id}/media/{file}/download returns JSON with .url path ending at /audio/master.{webm\|wav} — browser-reachable via MINIO_PUBLIC_ENDPOINT (Pack D-3 Option B kept). (weight 3: runtime-fixture-dependent; static-grep DASHBOARD_AUDIO_STREAMS_FROM_BUCKET carries the structural proof at full weight) | 3 | ⬜ missing | `lite`: check DOWNLOAD_RETURNS_PRESIGNED_URL_TO_MASTER not found in any report; `compose`: v0.10.6-runtime-smokes/DOWNLOAD_RETURNS_PRESIGNED_URL_TO_MASTER: gateway_url + api_token state not present; `helm`: check DOWNLOAD_RETURNS_PRESIGNED_URL_TO_MASTER not found in any report |
+| dashboard-audio-streams-from-bucket | dashboard reads /recordings/.../download (NOT /raw); <audio src> binds to the presigned URL; native HTTP Range fires on user seek | 10 | ✅ pass | `lite`: v0.10.6-static-greps/DASHBOARD_AUDIO_STREAMS_FROM_BUCKET: dashboard reads /download → presigned URL; `compose`: v0.10.6-static-greps/DASHBOARD_AUDIO_STREAMS_FROM_BUCKET: dashboard reads /download → presigned URL; `helm`: v0.10.6-static-greps/DASHBOARD_AUDIO_STREAMS_FROM_BUCKET: dashboard … |
+| dashboard-meetings-pagination-tracks-unfiltered-offset | dashboard meetings-store.ts paginates by explicit _offset cursor + dedupes by meeting.id (closes GH #304 — duplicate rows when redacted shells filtered out) | 10 | ✅ pass | `lite`: v0.10.6-static-greps/DASHBOARD_MEETINGS_PAGINATION_TRACKS_UNFILTERED_OFFSET: meetings-store.ts uses explicit _offset cursor + dedupe-by-meeting.id (closes #304 duplicate-rows class); `compose`: v0.10.6-static-greps/DASHBOARD_MEETINGS_PAGINATION_TRACKS_UNFILTERED_OFFSET: meetings-store.ts … |
 
 <!-- END AUTO-DOD -->
 

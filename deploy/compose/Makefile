@@ -159,7 +159,14 @@ build-bot-image: check_docker
 
 build-lite: check_docker
 	@echo "Building $(DOCKERHUB_USER)/vexa-lite:$(BUILD_TAG)..."
-	docker build --platform linux/amd64 -t $(DOCKERHUB_USER)/vexa-lite:$(BUILD_TAG) -f $(ROOT)/deploy/lite/Dockerfile.lite $(ROOT)
+	@# v0.10.5.3 Pack D-1 follow-up: pass NEXT_PUBLIC_VEXA_OSS_VERSION as build-arg
+	@# so the dashboard's prebuild generator inside the lite container has a
+	@# version source. VERSION file is the canonical truth.
+	docker build --platform linux/amd64 \
+		--build-arg NEXT_PUBLIC_VEXA_OSS_VERSION=$(VERSION) \
+		--build-arg NEXT_PUBLIC_VEXA_OSS_RELEASE_DATE=$(shell date +%Y-%m-%d) \
+		-t $(DOCKERHUB_USER)/vexa-lite:$(BUILD_TAG) \
+		-f $(ROOT)/deploy/lite/Dockerfile.lite $(ROOT)
 
 build-transcript-rendering:
 	@echo "Building transcript-rendering package..."
@@ -167,7 +174,10 @@ build-transcript-rendering:
 
 build: check_docker build-bot-image build-transcript-rendering build-lite
 	@echo "Building all images with tag: $(BUILD_TAG)"
-	IMAGE_TAG=$(BUILD_TAG) $(COMPOSE_CMD) build
+	@# v0.10.5.3 Pack D-1 follow-up: VEXA_VERSION + VEXA_RELEASE_DATE are
+	@# read by docker-compose.yml's dashboard service `args:` block to feed
+	@# the prebuild generator inside the dashboard image build.
+	IMAGE_TAG=$(BUILD_TAG) VEXA_VERSION=$(VERSION) VEXA_RELEASE_DATE=$(shell date +%Y-%m-%d) $(COMPOSE_CMD) build
 	@echo "$(BUILD_TAG)" > $(LAST_TAG_FILE)
 	@echo ""
 	@echo "All images tagged: $(BUILD_TAG)"
@@ -208,41 +218,56 @@ down: check_docker
 # Creates a default user (if needed) and a bot+browser+tx API key, writes VEXA_API_KEY to .env.
 # The dashboard uses this for WebSocket auth and transcript reads.
 setup-api-key: check_docker
-	@if grep -qE '^VEXA_API_KEY=.+' $(ENV_FILE) 2>/dev/null; then \
-		echo "VEXA_API_KEY already set in .env — skipping."; \
-	else \
-		API_PORT=$$(grep -E '^API_GATEWAY_HOST_PORT=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
-		API_PORT=$${API_PORT:-8056}; \
-		ADMIN_TK=$$(grep -E '^ADMIN_TOKEN=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
-		ADMIN_TK=$${ADMIN_TK:-changeme}; \
-		USER_ID=$$(curl -sf "http://localhost:$$API_PORT/admin/users?limit=1" \
-			-H "X-Admin-API-Key: $$ADMIN_TK" 2>/dev/null \
-			| python3 -c "import sys,json; u=json.load(sys.stdin); print(u[0]['id'] if u else '')" 2>/dev/null); \
-		if [ -z "$$USER_ID" ]; then \
-			echo "No users found — creating default user..."; \
-			USER_ID=$$(curl -sf -X POST "http://localhost:$$API_PORT/admin/users" \
-				-H "X-Admin-API-Key: $$ADMIN_TK" -H "Content-Type: application/json" \
-				-d '{"email":"admin@vexa.ai","name":"Admin","max_concurrent_bots":10}' 2>/dev/null \
-				| python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null); \
+	@# v0.10.5 R3 fix (2026-04-27): validate existing VEXA_API_KEY before
+	@# skipping. The earlier "skip-if-set" default left stale tokens in
+	@# .env after redeploy when admin-api re-seeded credentials, causing
+	@# dashboard 401 from /bots/status (DASHBOARD_API_KEY_VALID gate red).
+	@# Now: if a key is present we PROBE the gateway with it; on 200 keep,
+	@# on anything else drop+regenerate so dashboard is always seeded with
+	@# a token the gateway accepts.
+	@API_PORT=$$(grep -E '^API_GATEWAY_HOST_PORT=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
+	API_PORT=$${API_PORT:-8056}; \
+	EXISTING_KEY=$$(grep -E '^VEXA_API_KEY=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
+	if [ -n "$$EXISTING_KEY" ]; then \
+		HTTP=$$(curl -s -o /dev/null -w '%{http_code}' \
+			-H "X-API-Key: $$EXISTING_KEY" \
+			"http://localhost:$$API_PORT/bots/status" 2>/dev/null || echo "000"); \
+		if [ "$$HTTP" = "200" ] || [ "$$HTTP" = "304" ]; then \
+			echo "VEXA_API_KEY in .env validates against gateway (HTTP $$HTTP) — keeping."; \
+			exit 0; \
 		fi; \
-		if [ -z "$$USER_ID" ]; then \
-			echo "WARNING: Could not find or create user (admin API not ready?). Dashboard WS will require login."; \
-		else \
-			TOKEN=$$(curl -sf -X POST "http://localhost:$$API_PORT/admin/users/$$USER_ID/tokens?scopes=bot,browser,tx&name=dashboard-ws" \
-				-H "X-Admin-API-Key: $$ADMIN_TK" 2>/dev/null \
-				| python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null); \
-			if [ -n "$$TOKEN" ]; then \
-				echo "VEXA_API_KEY=$$TOKEN" >> $(ENV_FILE); \
-				echo "Created VEXA_API_KEY for user $$USER_ID (dashboard WS auth)."; \
-				if [ -f $(LAST_TAG_FILE) ]; then \
-					export IMAGE_TAG=$$(cat $(LAST_TAG_FILE)); \
-				else \
-					export IMAGE_TAG=dev; \
-				fi; \
-				$(COMPOSE_CMD) up -d dashboard; \
+		echo "VEXA_API_KEY in .env is stale (gateway returned HTTP $$HTTP) — regenerating."; \
+		sed -i.bak '/^VEXA_API_KEY=/d' $(ENV_FILE) && rm -f $(ENV_FILE).bak; \
+	fi; \
+	ADMIN_TK=$$(grep -E '^ADMIN_TOKEN=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
+	ADMIN_TK=$${ADMIN_TK:-changeme}; \
+	USER_ID=$$(curl -sf "http://localhost:$$API_PORT/admin/users?limit=1" \
+		-H "X-Admin-API-Key: $$ADMIN_TK" 2>/dev/null \
+		| python3 -c "import sys,json; u=json.load(sys.stdin); print(u[0]['id'] if u else '')" 2>/dev/null); \
+	if [ -z "$$USER_ID" ]; then \
+		echo "No users found — creating default user..."; \
+		USER_ID=$$(curl -sf -X POST "http://localhost:$$API_PORT/admin/users" \
+			-H "X-Admin-API-Key: $$ADMIN_TK" -H "Content-Type: application/json" \
+			-d '{"email":"admin@vexa.ai","name":"Admin","max_concurrent_bots":10}' 2>/dev/null \
+			| python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null); \
+	fi; \
+	if [ -z "$$USER_ID" ]; then \
+		echo "WARNING: Could not find or create user (admin API not ready?). Dashboard WS will require login."; \
+	else \
+		TOKEN=$$(curl -sf -X POST "http://localhost:$$API_PORT/admin/users/$$USER_ID/tokens?scopes=bot,browser,tx&name=dashboard-ws" \
+			-H "X-Admin-API-Key: $$ADMIN_TK" 2>/dev/null \
+			| python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null); \
+		if [ -n "$$TOKEN" ]; then \
+			echo "VEXA_API_KEY=$$TOKEN" >> $(ENV_FILE); \
+			echo "Created VEXA_API_KEY for user $$USER_ID (dashboard WS auth)."; \
+			if [ -f $(LAST_TAG_FILE) ]; then \
+				export IMAGE_TAG=$$(cat $(LAST_TAG_FILE)); \
 			else \
-				echo "WARNING: Could not create API key for user $$USER_ID. Dashboard WS will require login."; \
+				export IMAGE_TAG=dev; \
 			fi; \
+			$(COMPOSE_CMD) up -d dashboard; \
+		else \
+			echo "WARNING: Could not create API key for user $$USER_ID. Dashboard WS will require login."; \
 		fi; \
 	fi
 

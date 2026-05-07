@@ -260,7 +260,17 @@ async def startup_event():
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     # Initialize Redis for Pub/Sub used by WS
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-    app.state.redis = await aioredis.from_url(redis_url, encoding="utf-8", decode_responses=True)
+    # v0.10.5 Pack C.1 — bounded socket config closes the silent-hang class (#267).
+    app.state.redis = await aioredis.from_url(
+        redis_url,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_timeout=10,
+        socket_connect_timeout=5,
+        socket_keepalive=True,
+        health_check_interval=30,
+        retry_on_timeout=True,
+    )
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -2006,6 +2016,77 @@ async def browser_delete_storage(token: str):
 
 
 # --- End Remote Browser Session Routes ---
+
+
+# --- v0.10.5 Pack X — synthetic-rig proxy routes ---
+#
+# Forward `/bots/internal/test/*` and `/bots/internal/callback/*` to
+# meeting-api so the synthetic test rig (`tests3/synthetic/`) can drive
+# OSS-side meeting lifecycle from the host without depending on the
+# docker network for service-to-service hostnames. meeting-api itself
+# enforces VEXA_ENV != production for the test endpoints — gateway
+# just passes them through.
+#
+# /bots/internal/callback/* was already reachable because runtime-api
+# delivers callbacks via the docker network (`http://localhost:8080`
+# from runtime-api's POV — meeting-api hostname). The synthetic rig
+# runs from the HOST, which has no docker-DNS access; the gateway
+# proxy is the only way to reach meeting-api externally.
+import os
+_PACK_X_TEST_ROUTES_ENABLED = os.environ.get("VEXA_ENV", "development") != "production"
+
+
+@app.api_route(
+    "/bots/internal/test/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE"],
+    include_in_schema=False,
+)
+async def synthetic_test_proxy(path: str, request: Request):
+    """Forward Pack X synthetic-rig calls to meeting-api.
+
+    require_auth=False because synthetic-rig callers don't carry user
+    tokens. meeting-api endpoint enforces VEXA_ENV != production gate
+    as the security boundary; gateway just passes through.
+    """
+    if not _PACK_X_TEST_ROUTES_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    url = f"{MEETING_API_URL}/bots/internal/test/{path}"
+    return await forward_request(app.state.http_client, request.method, url, request, require_auth=False)
+
+
+@app.api_route(
+    "/bots/internal/callback/{path:path}",
+    methods=["POST"],
+    include_in_schema=False,
+)
+async def synthetic_callback_proxy(path: str, request: Request):
+    """Forward bot lifecycle callbacks to meeting-api — SYNTHETIC RIG ONLY.
+
+    v0.10.5.3 audit (CRITICAL): this route was previously ungated; in
+    production, anyone with a session_uid (UUIDv4) could POST here and
+    drive arbitrary meeting state transitions via meeting-api's internal
+    callback endpoint (force completion, inject failure_stage, trigger
+    webhook deliveries). Audit finding bounced human → triage → develop.
+    Production exposure was real because session_uids are not authentication.
+
+    Real bot callbacks in production go runtime-api → meeting-api directly
+    (in-cluster, docker-network-only, no auth needed because the network
+    boundary IS the boundary). The api-gateway proxy here exists ONLY for
+    the Pack X synthetic test rig that drives callbacks from outside the
+    cluster. Same env gate as the synthetic_test_proxy route below — both
+    return 404 in production.
+
+    require_auth=False because synthetic-rig callers don't carry user
+    tokens (the rig is its own boundary).
+    """
+    if not _PACK_X_TEST_ROUTES_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    url = f"{MEETING_API_URL}/bots/internal/callback/{path}"
+    return await forward_request(app.state.http_client, request.method, url, request, require_auth=False)
+
+
+# --- End Pack X synthetic-rig proxy routes ---
+
 
 # --- WebSocket Multiplex Endpoint ---
 @app.websocket("/ws")

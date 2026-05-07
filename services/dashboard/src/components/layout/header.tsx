@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Settings, Menu, LogOut, User, BookOpen, ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Logo } from "@/components/ui/logo";
+import { VersionChip } from "@/components/version-chip";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -19,6 +20,7 @@ import {
 } from "@/components/ui/tooltip";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { useAuthStore } from "@/stores/auth-store";
+import { getDocsUrl } from "@/lib/docs/webapp-url";
 import { useRuntimeConfig } from "@/hooks/use-runtime-config";
 
 interface HeaderProps {
@@ -49,11 +51,14 @@ export function Header({ onMenuClick }: HeaderProps) {
           <span className="sr-only">Toggle menu</span>
         </Button>
 
-        {/* Logo */}
-        <Link href="/" className="flex items-center gap-2 group">
-          <Logo size="md" showText={false} className="group-hover:scale-105 transition-transform" />
-          <span className="hidden sm:inline-block text-[15px] font-semibold tracking-[-0.01em] text-foreground">vexa</span>
-        </Link>
+        {/* Logo + version chip */}
+        <div className="flex items-center gap-2.5">
+          <Link href="/" className="flex items-center gap-2 group">
+            <Logo size="md" showText={false} className="group-hover:scale-105 transition-transform" />
+            <span className="hidden sm:inline-block text-[15px] font-semibold tracking-[-0.01em] text-foreground">vexa</span>
+          </Link>
+          <VersionChip className="hidden sm:inline-flex" />
+        </div>
 
         {/* Spacer */}
         <div className="flex-1" />
@@ -63,10 +68,12 @@ export function Header({ onMenuClick }: HeaderProps) {
           <Tooltip>
             <TooltipTrigger asChild>
               <Button variant="ghost" size="icon" asChild className="text-muted-foreground">
-                <Link href="/docs">
+                {/* v0.10.5.3 Pack D-2: link to canonical docs.vexa.ai (was internal /docs).
+                    External link via <a> + getDocsUrl() since docs live in a separate site. */}
+                <a href={getDocsUrl("/")} target="_blank" rel="noopener noreferrer">
                   <BookOpen className="h-5 w-5" />
                   <span className="sr-only">Full Documentation</span>
-                </Link>
+                </a>
               </Button>
             </TooltipTrigger>
             <TooltipContent>

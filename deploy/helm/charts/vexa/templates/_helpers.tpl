@@ -105,10 +105,50 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "vexa.deploymentStrategy" -}}
+{{/*
+v0.10.5.3 Pack H — zero-downtime rolling update.
+
+Pre-fix: maxSurge: 0, maxUnavailable: 1. With replicaCount: 1, this killed
+the OLD pod before creating the NEW pod, causing 502s during any image
+bump (e.g. the v0.10.5.2 cycle outage where dashboard + webapp went 502
+because new image tags didn't exist on the registry — old pods were
+already killed by the time helm upgrade tried to create the new pods).
+
+Post-fix: maxSurge: 1, maxUnavailable: 0. NEW pod is created first;
+helm waits until it's Ready before killing the OLD. With --atomic --wait
+on the helm upgrade call (release-helm-upgrade-safe Make target),
+failed image pulls auto-rollback without ever exposing the outage.
+
+Works on replicaCount=1 (1 old -> 1 old + 1 new -> 1 new) and
+replicaCount>1 (rolling progresses one extra at a time).
+*/}}
 strategy:
   type: RollingUpdate
   rollingUpdate:
-    maxSurge: 0
-    maxUnavailable: 1
+    maxSurge: 1
+    maxUnavailable: 0
+{{- end -}}
+
+{{/*
+v0.10.5 Pack C.5 — Redis durability paired invariant.
+
+AOF (appendonly + appendfsync) is the per-write durability mechanism.
+`stop-writes-on-bgsave-error: no` allows writes to continue when the
+snapshot mechanism fails (block-volume hiccup, disk-full, fsync stall) —
+which is non-blocking when AOF is on. Setting `stop-writes-on-bgsave-error: yes`
+WITHOUT `appendonly: yes` would create a write-loss window: Redis would
+accept writes that aren't durable anywhere if BGSAVE fails. Refuse to render.
+
+The 2026-04-21 redis-storage-cascade incident was triggered by exactly
+this anti-pattern: BGSAVE failed, default `stop-writes-on-bgsave-error: yes`
+froze writes for 46 min. With AOF + bgsave-error: no, BGSAVE failures
+become non-blocking. Industry-standard Redis-as-stream-buffer config.
+*/}}
+{{- define "vexa.validateRedisDurability" -}}
+{{- $aof := .Values.redis.durability.appendonly | default "yes" -}}
+{{- $bgsaveBlocks := .Values.redis.durability.stopWritesOnBgsaveError | default "no" -}}
+{{- if and (eq $bgsaveBlocks "yes") (ne $aof "yes") -}}
+{{- required "INVALID redis.durability config: stopWritesOnBgsaveError=yes requires appendonly=yes (paired AOF + BGSAVE durability invariant — see v0.10.5 Pack C.5). Without AOF, blocking writes on BGSAVE failure means writes that arrive while BGSAVE is failing have no durable record anywhere." "" -}}
+{{- end -}}
 {{- end -}}
 
